@@ -1,0 +1,27 @@
+[project]
+name = "db_deployer"
+version = "0.1.0"
+description = "Deploy database objects to PostgreSQL"
+license = "GPL-2.0-only"
+license-files = ["LICENSE"]
+authors = [
+    {name = "Roy P. Ammeraal"},
+]
+dependencies = [
+    "psycopg2",
+    "appdirs",
+    "psutil",
+    "pycryptodome",
+    "pycryptodomex",
+    "pwinput",
+    "SQLAlchemy",
+    "sqlparse",
+    "toml"
+]
+
+[project.scripts]
+db_deployer = "db_deployer.cli:main"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
