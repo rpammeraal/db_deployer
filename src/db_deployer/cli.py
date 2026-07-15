@@ -247,24 +247,6 @@ def process_role_change(db,file):
     return change_script
 
 
-
-def process_privilege_change(db, file):
-    change_script = []
-    owner=file.filename().replace('.sql','')
-    print("Processing privilegs file {0} of type {1} owner {2}:".format(file.filename(),file.object_type(),owner))
-    
-    change_script.append(f"--   connecting to {db.db_name()} AS {owner} ")
-    change_script.append(f"\tconnect {db.db_name()} - {owner}")
-    change_script.append(f"\tpset verbosity terse")
-    contents = []
-    contents = file.contents()
-    contents = sqlpreprocessor.preprocess(contents)
-    change_script.extend(contents)
-    change_script.append(f"\tpset verbosity normal")
-
-    return change_script
-
-
 def get_items_to_be_refreshed(cache, path_list, dependencies, force_flag, items):
     for path in path_list:
 
@@ -380,9 +362,13 @@ def process_objects(db, cache, list, force_flag, dev_flag, verbose_flag):
                     new_list=[]
                     num_deps_left=len(dependency) #   Not quite correct, we'll calculate after
                     while num_deps_left>0:
-                        print(f"\tDependencies")
-                        for d in dependency:
-                            print(f"\t\t{d} -> {','.join(dependency[d])}")
+                        if verbose_flag:
+                            print(f"\tDependencies:")
+                            for d in dependency:
+                                if dependency[d]:
+                                    print(f"\t\t{d} -> {','.join(dependency[d])}")
+
+                        prev_deps_left = num_deps_left
 
                         for f in complete_list:
                             fn=basename(f)
@@ -411,7 +397,14 @@ def process_objects(db, cache, list, force_flag, dev_flag, verbose_flag):
                         for f in dependency:
                             #print(f"\t\t{f}:{dependency[f]}:len={len(dependency[f])}")
                             num_deps_left+=len(dependency[f])
-                        print(f"\tnum_deps_left={num_deps_left}")
+
+                        if num_deps_left == prev_deps_left:
+                            #   No progress this iteration — remaining dependencies are unresolvable
+                            print("\tERROR: unresolvable dependencies:")
+                            for d in dependency:
+                                if dependency[d]:
+                                    print(f"\t\t{d} depends on {','.join(dependency[d])} which are not present")
+                            sys.exit(-1)
 
                     #   Add missing items from complete_list to new_list (as their dependencies may have gone)
                     for i in complete_list:
@@ -435,7 +428,7 @@ def process_objects(db, cache, list, force_flag, dev_flag, verbose_flag):
             #	read table definition in file
             file = sqlfile(path)
 
-            if cache.has_file_changed(file) == 1 or force_flag == 1 or type=='privilege':
+            if cache.has_file_changed(file) == 1 or force_flag == 1:
 
                 if type == file.object_type():
                     print("\t" + file.object_name())
@@ -482,7 +475,6 @@ def process_objects(db, cache, list, force_flag, dev_flag, verbose_flag):
 
                     elif (file.object_type() == 'privilege'):
                         privilege_file.append(file)
-                        #change_script = change_script + process_privilege_change( db, file)
 
                     elif (file.object_type() == 'database'):
                         pre_script = pre_script + process_database_change(db,file)
@@ -519,19 +511,19 @@ def store_change_script(database_name, change_script):
 
 
 def execute_privileges(current_db,privileges):
+
     print("Executing privileges:")
     for f in privileges:
-
-        owner=f.filename().replace('.sql','')
-        print("Processing privilegs file {0} of type {1} owner {2}:".format(f.filename(),f.object_type(),owner))
+        print("Processing privileges file {0}:".format(f.filename()))
 
         change_script = f.contents()
+        change_script = sqlpreprocessor.preprocess(change_script)
         change_script.append('--   END OF PRIVILEGES\n')
 
-        p_db=db(user=owner,host=current_db.host(),port=current_db.port(),database=current_db.db_name())
-        store_change_script(current_db.db_name(), change_script)
-        result = p_db.execute(change_script, True)  #verbose_flag)
-       
+        store_change_script(current_db.db_name(),change_script)
+        result = current_db.execute(change_script,True)
+        if result is not None:
+            errorExit(result)
 
 def process_files(repo_path, cache, files, database_name, force_flag, verbose_flag, dev_flag):
 

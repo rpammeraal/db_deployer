@@ -76,6 +76,8 @@ class cache:
         return
 
 
-    def _get_local_path(self, path):
-         return path.replace(self._global_root, '')
+    def _get_local_path(self,path):
+        if path.startswith(self._global_root):
+            return path[len(self._global_root):]
+        return path
 

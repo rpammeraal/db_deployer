@@ -115,6 +115,37 @@ The SQL repo must follow this structure:
 
 Supported object types: `schema`, `table`, `function`, `view`, `data`, `index`, `role`, `privilege`.
 
+### Ordering within an object type
+
+Within a single object type, db_deployer processes files alphabetically by default. Two optional per-directory files let you override or supplement that:
+
+**`manifest.txt`** — pin an explicit order for named files.
+
+Place a `manifest.txt` alongside SQL files in any object-type directory. List filenames one per line, in the order they should be processed. Files listed in the manifest are processed first in the given order; files not listed follow in alphabetical order.
+
+```
+# database/rock_dev/table/manifest.txt
+users.sql
+sessions.sql
+orders.sql
+```
+
+**`dependency.txt`** — declare parent/child relationships and let db_deployer topologically sort.
+
+Format is one dependency per line, `<child>:<parent>`. A file listed as `child` will not be processed until every `parent` it depends on has been processed. Multiple parents per child are declared on separate lines:
+
+```
+# database/offsite/table/dependency.txt
+core.file.sql:core.peer.sql
+core.remote_peer.sql:core.peer.sql
+core.remote_file.sql:core.file.sql
+core.remote_file.sql:core.remote_peer.sql
+```
+
+Dependencies are resolved before deploy. If a parent file has changed and is redeployed, all its transitive children are also marked as changed and redeployed, even if their own contents are unchanged — this keeps foreign keys and view definitions consistent when their referents change.
+
+Use `manifest.txt` for stable, explicit ordering (e.g. schemas that must exist before tables). Use `dependency.txt` for expressing real referential relationships that should trigger cascaded redeploys.
+
 ## Usage
 
 ```
@@ -219,3 +250,4 @@ Copyright (C) 2026 Roy P. Ammeraal
 db_deployer is free software, licensed under the GNU General Public License, version 2 (GPL-2.0-only). See the `LICENSE` file for the full text.
 
 Running db_deployer against your own SQL repository does not place your SQL or database under the GPL — that's arm's-length use, not distribution of a derivative work. The GPL's copyleft obligations apply when db_deployer itself (modified or unmodified) is redistributed, or when other code links against `db_deployer.lib` modules.
+

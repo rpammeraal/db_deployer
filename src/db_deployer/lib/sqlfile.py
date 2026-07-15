@@ -151,10 +151,15 @@ class sqlfile:
     #	Returns the name of the object 'as-is' -- case is not modified
     def object_name(self):
         object_name = ''
+
         if (self.object_type() == 'schema' or self.object_type() == 'table'):
-            object_name = self._sql[0].split()[2]
-            object_name = object_name[:-1] if object_name.endswith(
-                ';') else object_name  #	remove trailing ';'
+            words = self._sql[0].split()
+            #   Skip optional IF NOT EXISTS (3 words)
+            if len(words) >= 5 and [w.upper() for w in words[2:5]] == ['IF','NOT','EXISTS']:
+                object_name = words[5]
+            else:
+                object_name = words[2]
+            object_name = object_name[:-1] if object_name.endswith(';') else object_name
 
         elif (self.object_type() == 'function'):
             #	include parameters for function, exclude RETURNS clause
@@ -162,7 +167,6 @@ class sqlfile:
             object_name = object_name[:object_name.find('RETURNS')]
 
         elif self.object_type() in ['view', 'datacube']:
-            #   account for optional keyword materialized
             if self._sql[0].split()[1].lower() == 'materialized':
                 object_name = self._sql[0].split()[3]
             else:
