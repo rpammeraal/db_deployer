@@ -8,6 +8,24 @@ from sqlparse import tokens
 from . import constants
 
 
+#	Matches a leading 'OR REPLACE' clause: CREATE OR REPLACE <object type> ...
+#	Anchored, so that an 'or replace' occurring further down in the statement
+#	(in a view body or a function body) is left alone.
+OR_REPLACE_PATTERN = re.compile(r'^(\s*CREATE)\s+OR\s+REPLACE\s+',re.IGNORECASE)
+
+
+#	Matches an index creation statement:
+#	CREATE [UNIQUE] INDEX [CONCURRENTLY] [IF NOT EXISTS] <name> ON [ONLY] <table> ...
+#	The index name is optional -- PostgreSQL generates one when it is omitted.
+INDEX_HEADER_PATTERN = re.compile(
+    r'^CREATE\s+(?:UNIQUE\s+)?INDEX\s+'
+    r'(?:CONCURRENTLY\s+)?'
+    r'(?:IF\s+NOT\s+EXISTS\s+)?'
+    r'(?:(?P<index>(?!ON\s)[^\s(]+)\s+)?'
+    r'ON\s+(?:ONLY\s+)?(?P<table>[^\s(]+)',
+    re.IGNORECASE)
+
+
 #	sqlfile contains  a definition of an SQL Object
 #	(such as a table, function, schema, etc.)
 class sqlfile:
@@ -87,6 +105,76 @@ class sqlfile:
     def hash(self):
         return self._hash
 
+
+    #	Return the position of the first word following an optional 'IF NOT EXISTS'
+    #	clause, starting to look at word position 'start'. When no such clause is
+    #	present, 'start' is returned unchanged.
+    @staticmethod
+    def skip_if_not_exists(words,start):
+        if len(words) >= start + 3 and [w.upper() for w in words[start:start + 3]] == ['IF','NOT','EXISTS']:
+            return start + 3
+
+        return start
+
+
+    #	Return the position of the object type word (TABLE, VIEW, FUNCTION, ...),
+    #	skipping an optional 'OR REPLACE' clause.
+    @staticmethod
+    def skip_or_replace(words):
+        if len(words) > 2 and words[1].upper() == 'OR' and words[2].upper() == 'REPLACE':
+            return 3
+
+        return 1
+
+
+    #	Return the signature ('<name>(<arguments>)') of a function or procedure,
+    #	with the name starting at word position 'start'. The argument list is
+    #	delimited by its matching closing parenthesis, so any RETURNS clause and
+    #	anything following it are excluded.
+    @staticmethod
+    def routine_signature(words,start):
+        signature = ' '.join(words[start:])
+
+        depth = 0
+        for position,character in enumerate(signature):
+            if character == '(':
+                depth = depth + 1
+            elif character == ')':
+                depth = depth - 1
+                if depth == 0:
+                    return signature[:position + 1]
+
+        #	No (complete) argument list found -- fall back to the bare name
+        name = words[start] if len(words) > start else ''
+        return name[:-1] if name.endswith(';') else name
+
+
+    #	Parse an index creation statement and return an (index_name,table_name) tuple.
+    #	Returns None when the statement does not create an index. The optional
+    #	UNIQUE, CONCURRENTLY and IF NOT EXISTS clauses are skipped, and index_name
+    #	is returned as '' for an unnamed index.
+    @staticmethod
+    def parse_index_header(statement):
+        match = INDEX_HEADER_PATTERN.match(statement.strip())
+        if match == None:
+            return None
+
+        index_name = match.group('index')
+
+        return (index_name if index_name != None else '',match.group('table'))
+
+
+    #	Return an (index_name,table_name) tuple for every index created in this file.
+    def index_definitions(self):
+        definitions = []
+
+        for statement in self._sql:
+            index_header = sqlfile.parse_index_header(statement)
+            if index_header != None:
+                definitions.append(index_header)
+
+        return definitions
+
     
     #	Return the object type (e.g. table, schema, ...) in lower case.
     def object_type(self):
@@ -98,22 +186,25 @@ class sqlfile:
         word_array = []
         word_array = header.split()
 
+        or_replace = False
+
+        if len(word_array)>2 and word_array[1] == 'or' and word_array[2] == 'replace':
+            #   Drop the 'OR REPLACE' clause from the header, so that everything
+            #   following it can be examined as if it were a plain CREATE. The
+            #   statement itself is only modified further down -- and only for
+            #   objects that this deployer drops before recreating them.
+            or_replace = True
+            word_array = word_array[:1] + word_array[3:]
+            header = ' '.join(word_array)
+
         if len(word_array)>1 and word_array[1] and word_array[1] == 'materialized':
-            header = header.replace('materialized ', '')
+            header = header.replace('materialized ','',1)
             self._sub_type = 'materialized'
 
-        if len(word_array)>1 and word_array[1] and word_array[1] == 'unique' and word_array[2] and word_array[2]=='index':
-            header = header.replace('unique ', 'index ')
+        if len(word_array)>2 and word_array[1] and word_array[1] == 'unique' and word_array[2] and word_array[2]=='index':
+            header = header.replace('unique ','index ',1)
             self._sub_type = 'unique'
 
-        if len(word_array)>1 and word_array[1] and word_array[1] == 'or' and word_array[2] == 'replace':
-            #   do a case insensitive replace on the actual header line,
-            #   as the 'OR REPLACE' will screw up (later generated) code.
-            pattern = re.compile("or replace ", re.IGNORECASE)
-            self._sql[0] = pattern.sub("", self._sql[0])
-            header = self._sql[0].lower()
-
-		
         object_type = None
 
         if len(header.split())>1:
@@ -123,13 +214,19 @@ class sqlfile:
 
         if object_type == 'view':
             #   inspect schema name to determine cube or view
-            (schema, object_name) = (header.split()[2]).split(".",2)
-            if schema == 'datacube':
-                object_type = schema
+            #   (skip an optional IF NOT EXISTS clause first)
+            words = header.split()
+            name_position = sqlfile.skip_if_not_exists(words,2)
+            qualified_name = words[name_position] if len(words) > name_position else ''
+
+            if qualified_name.find(".") != -1:
+                schema = qualified_name.split(".",1)[0]
+                if schema == 'datacube':
+                    object_type = schema
         elif object_type == 'foreign':
             object_type = 'foreign_table'
 
-        if object_type not in ['database','schema', 'table', 'function', 'view', 'datacube', 'index', 'foreign_table', 'role']:
+        if object_type not in ['database','schema', 'table', 'function', 'procedure', 'view', 'datacube', 'index', 'foreign_table', 'role']:
             object_type = 'data'
 
             #   determine if privilege based on directory path:
@@ -140,6 +237,14 @@ class sqlfile:
             object_type = 'role'
         elif path_array[-2] == 'database':
             object_type = 'database'
+
+        if or_replace == True and object_type in ['function','procedure','view','datacube']:
+            #   These objects are dropped before they are recreated, and the
+            #   'OR REPLACE' clause would screw up the (later generated) code,
+            #   so remove it from the statement itself. Object types that are
+            #   deployed as-is keep their 'OR REPLACE', as that is what makes
+            #   them re-runnable.
+            self._sql[0] = OR_REPLACE_PATTERN.sub(r'\1 ',self._sql[0],count=1)
 
         return object_type
 
@@ -155,22 +260,30 @@ class sqlfile:
         if (self.object_type() == 'schema' or self.object_type() == 'table'):
             words = self._sql[0].split()
             #   Skip optional IF NOT EXISTS (3 words)
-            if len(words) >= 5 and [w.upper() for w in words[2:5]] == ['IF','NOT','EXISTS']:
-                object_name = words[5]
-            else:
-                object_name = words[2]
+            name_position = sqlfile.skip_if_not_exists(words,2)
+            object_name = words[name_position] if len(words) > name_position else ''
             object_name = object_name[:-1] if object_name.endswith(';') else object_name
 
-        elif (self.object_type() == 'function'):
-            #	include parameters for function, exclude RETURNS clause
-            object_name = ' '.join(self._sql[0].split()[2:])
-            object_name = object_name[:object_name.find('RETURNS')]
+        elif (self.object_type() == 'function' or self.object_type() == 'procedure'):
+            #	include parameters for the routine, exclude the RETURNS clause
+            words = self._sql[0].split()
+            object_name = sqlfile.routine_signature(words,sqlfile.skip_or_replace(words) + 1)
 
         elif self.object_type() in ['view', 'datacube']:
-            if self._sql[0].split()[1].lower() == 'materialized':
-                object_name = self._sql[0].split()[3]
-            else:
-                object_name = self._sql[0].split()[2]
+            words = self._sql[0].split()
+            #   CREATE [OR REPLACE] [MATERIALIZED] VIEW [IF NOT EXISTS] <name>
+            type_position = sqlfile.skip_or_replace(words)
+            name_position = type_position + 1
+            if len(words) > type_position and words[type_position].lower() == 'materialized':
+                name_position = type_position + 2
+            name_position = sqlfile.skip_if_not_exists(words,name_position)
+            object_name = words[name_position] if len(words) > name_position else ''
+
+        elif self.object_type() == 'index':
+            #   A file may create more than one index -- report the first one.
+            definitions = self.index_definitions()
+            if len(definitions) > 0:
+                object_name = definitions[0][0]
 
         elif (self.object_type() in ['data','privilege']):
             object_name = self._path
