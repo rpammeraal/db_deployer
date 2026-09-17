@@ -26,6 +26,17 @@ INDEX_HEADER_PATTERN = re.compile(
     re.IGNORECASE)
 
 
+#	Matches a policy creation statement:
+#	CREATE POLICY <name> ON <table> ...
+#	Both identifiers may be double-quoted (and a quoted table name may be
+#	schema-qualified), so a token is any run of quoted or unquoted characters.
+POLICY_HEADER_PATTERN = re.compile(
+    r'^CREATE\s+POLICY\s+'
+    r'(?P<policy>(?:"[^"]*"|[^\s"])+)\s+'
+    r'ON\s+(?P<table>(?:"[^"]*"|[^\s"(;])+)',
+    re.IGNORECASE)
+
+
 #	sqlfile contains  a definition of an SQL Object
 #	(such as a table, function, schema, etc.)
 class sqlfile:
@@ -175,6 +186,29 @@ class sqlfile:
 
         return definitions
 
+
+    #	Parse a policy creation statement and return a (policy_name,table_name) tuple.
+    #	Returns None when the statement does not create a policy.
+    @staticmethod
+    def parse_policy_header(statement):
+        match = POLICY_HEADER_PATTERN.match(statement.strip())
+        if match == None:
+            return None
+
+        return (match.group('policy'),match.group('table'))
+
+
+    #	Return a (policy_name,table_name) tuple for every policy created in this file.
+    def policy_definitions(self):
+        definitions = []
+
+        for statement in self._sql:
+            policy_header = sqlfile.parse_policy_header(statement)
+            if policy_header != None:
+                definitions.append(policy_header)
+
+        return definitions
+
     
     #	Return the object type (e.g. table, schema, ...) in lower case.
     def object_type(self):
@@ -237,6 +271,10 @@ class sqlfile:
             object_type = 'role'
         elif path_array[-2] == 'database':
             object_type = 'database'
+        elif path_array[-2] in ['data','post_deployment']:
+            #   Anything goes in these directories -- the contents are never
+            #   parsed, the directory alone decides the type.
+            object_type = path_array[-2]
 
         if or_replace == True and object_type in ['function','procedure','view','datacube']:
             #   These objects are dropped before they are recreated, and the
@@ -285,7 +323,7 @@ class sqlfile:
             if len(definitions) > 0:
                 object_name = definitions[0][0]
 
-        elif (self.object_type() in ['data','privilege']):
+        elif (self.object_type() in ['data','privilege','post_deployment']):
             object_name = self._path
 
         elif (self.object_type() == 'foreign_table'):
