@@ -29,14 +29,16 @@ from .lib.cache import cache
 from .lib.sqlfile import sqlfile
 from .lib.sqlpreprocessor import sqlpreprocessor
 
-SUPPORTED_OBJECTS = [ 'role', 'database', 'schema', 'table', 'function', 'procedure', 'view', 'data', 'index', 'privilege' ]
+SUPPORTED_OBJECTS = [ 'role', 'database', 'schema', 'table', 'function', 'procedure', 'view', 'data', 'index', 'privilege', 'post_deployment' ]
 
 #	Object types that may share a directory: PostgreSQL routines are
 #	interchangeable as far as the repository layout is concerned, so a
-#	procedure may live in the function directory and vice versa.
+#	procedure may live in the function directory and vice versa. A datacube
+#	is a view living in the datacube schema.
 DIRECTORY_TYPE_ALIAS = {
     'function': ['function','procedure'],
-    'procedure': ['procedure','function']
+    'procedure': ['procedure','function'],
+    'view': ['view','datacube']
 }
 
 
@@ -319,8 +321,15 @@ def process_view_change(db, file, dev_flag):
 def process_data_change(db, file):
     change_script = []
 
+    #   A policy cannot be created with OR REPLACE, so drop it first to make
+    #   the file re-runnable. Everything else is passed through untouched.
     contents = []
-    contents = file.contents()
+    for statement in file.contents():
+        policy_header = sqlfile.parse_policy_header(statement)
+        if policy_header != None:
+            contents.append("DROP POLICY IF EXISTS {0} ON {1};".format(policy_header[0],policy_header[1]))
+        contents.append(statement)
+
     contents = sqlpreprocessor.preprocess(contents)
     change_script.extend(contents)
 
@@ -376,6 +385,7 @@ def process_objects(db, cache, list, force_flag, dev_flag, verbose_flag):
     privilege_file = []
     change_script = []
     pre_script = []
+    post_script = []
     manifest = {}
     dependency = {}
     manifest_file_processed = []
@@ -578,9 +588,19 @@ def process_objects(db, cache, list, force_flag, dev_flag, verbose_flag):
                     elif (file.object_type() == 'database'):
                         pre_script = pre_script + process_database_change(db,file)
 
+                    elif (file.object_type() == 'post_deployment'):
+                        post_script = post_script + process_data_change(
+                            db, file)
+
                     cache.add_entry(file)
 
-    return pre_script, change_script, privilege_file
+                else:
+                    #   A file whose contents do not match its directory would be
+                    #   silently skipped otherwise -- abort instead.
+                    errorExit("{0} is in the {1} directory but contains a {2} definition".format(
+                        path, type, file.object_type()))
+
+    return pre_script, change_script, privilege_file, post_script
 
 
 def process_database_change(db,file):
@@ -624,6 +644,27 @@ def execute_privileges(current_db,privileges):
         if result is not None:
             errorExit(result)
 
+def execute_post_deployment(current_db,post_script,verbose_flag):
+
+    if len(post_script) == 0:
+        return
+
+    print("Executing post-deployment:")
+
+    change_script = []
+    change_script.append("--\tSTART OF POST-DEPLOYMENT on " + current_db.db_name())
+    change_script.append("BEGIN;")
+    change_script.extend(post_script)
+    change_script.append("COMMIT;")
+    change_script.append("--\tEND OF POST-DEPLOYMENT")
+
+    file_name = store_change_script(current_db.db_name(),change_script)
+    print("Post-deployment script available at: " + file_name)
+    result = current_db.execute(change_script,verbose_flag)
+    if result is not None:
+        errorExit(result)
+
+
 def process_files(repo_path, cache, files, database_name, force_flag, verbose_flag, dev_flag):
 
     db_path = repo_path + '/database/' + database_name
@@ -660,7 +701,7 @@ def process_files(repo_path, cache, files, database_name, force_flag, verbose_fl
     change_script.append("--	START OF CHANGESCRIPT on " + database_name)
     change_script.append("BEGIN;")
 
-    ps,cs,pr=process_objects(current_db, cache, objects, force_flag, dev_flag, verbose_flag)
+    ps,cs,pr,po=process_objects(current_db, cache, objects, force_flag, dev_flag, verbose_flag)
 
     #   Run pre-script (CREATE DATABASE and other non-transactional statements) FIRST,
     #   in autocommit, before opening the transaction for everything else.
@@ -687,9 +728,13 @@ def process_files(repo_path, cache, files, database_name, force_flag, verbose_fl
         if (result != None):
             errorExit(result)
 
-    cache.commit()
-
     execute_privileges(current_db,pr)
+
+    execute_post_deployment(current_db,po,verbose_flag)
+
+    #   Commit the cache only once everything has been deployed, so that a
+    #   failing privilege or post-deployment script is retried on the next run.
+    cache.commit()
 
     current_db.close_db()
 
