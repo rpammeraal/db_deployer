@@ -37,8 +37,13 @@ all: build
 
 build: $(PYZ)
 
+# The shebang of the pyz is pinned to the interpreter that backs the venv
+# (the one $(PYTHON) resolved to when the venv was created), so the bundled
+# compiled extensions always match the Python that runs them. A bare
+# "/usr/bin/env python3" would pick up whatever is first on PATH at run
+# time, which is not necessarily the same interpreter.
 $(PYZ): $(SRC) | $(SHIV) check-deps
-	$(SHIV) -c db_deployer -o $(PYZ) --python "/usr/bin/env $(notdir $(PYTHON))" .
+	$(SHIV) -c db_deployer -o $(PYZ) --python "$$($(VENV_BIN)/python -c 'import sys;print(sys._base_executable)')" .
 
 $(SHIV): | $(VENV)
 	$(PIP) install --upgrade pip shiv
