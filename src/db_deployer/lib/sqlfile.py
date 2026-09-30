@@ -37,6 +37,17 @@ POLICY_HEADER_PATTERN = re.compile(
     re.IGNORECASE)
 
 
+#	Matches a trigger creation statement:
+#	CREATE [OR REPLACE] [CONSTRAINT] TRIGGER <name> { BEFORE | AFTER | INSTEAD OF } <events> ON <table> ...
+#	The first ON following the name introduces the table -- no event keyword
+#	contains ON as a word of its own.
+TRIGGER_HEADER_PATTERN = re.compile(
+    r'^CREATE\s+(?:OR\s+REPLACE\s+)?(?:CONSTRAINT\s+)?TRIGGER\s+'
+    r'(?P<trigger>(?:"[^"]*"|[^\s"])+)\s+'
+    r'.*?\bON\s+(?P<table>(?:"[^"]*"|[^\s"(;])+)',
+    re.IGNORECASE | re.DOTALL)
+
+
 #	sqlfile contains  a definition of an SQL Object
 #	(such as a table, function, schema, etc.)
 class sqlfile:
@@ -206,6 +217,29 @@ class sqlfile:
             policy_header = sqlfile.parse_policy_header(statement)
             if policy_header != None:
                 definitions.append(policy_header)
+
+        return definitions
+
+
+    #	Parse a trigger creation statement and return a (trigger_name,table_name) tuple.
+    #	Returns None when the statement does not create a trigger.
+    @staticmethod
+    def parse_trigger_header(statement):
+        match = TRIGGER_HEADER_PATTERN.match(statement.strip())
+        if match == None:
+            return None
+
+        return (match.group('trigger'),match.group('table'))
+
+
+    #	Return a (trigger_name,table_name) tuple for every trigger created in this file.
+    def trigger_definitions(self):
+        definitions = []
+
+        for statement in self._sql:
+            trigger_header = sqlfile.parse_trigger_header(statement)
+            if trigger_header != None:
+                definitions.append(trigger_header)
 
         return definitions
 

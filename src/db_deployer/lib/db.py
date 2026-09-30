@@ -154,6 +154,133 @@ class db:
         return defs
 
 
+    #   Return every object that depends -- directly, or through other
+    #   dependents -- on the catalog object (classid,objid), or on one of its
+    #   columns when attnum is given. classid is a catalog name ('pg_class',
+    #   'pg_proc'). The result is a list of (type,identity) tuples as reported
+    #   by pg_identify_object(), ordered so that no object precedes an object
+    #   that depends on it: dropping them in list order never needs CASCADE.
+    #   Only normal ('n') dependencies count; objects that go away with their
+    #   owner anyway (indexes, constraints, sequences) are not reported.
+    def dependents(self,classid,objid,attnum=None,found=None):
+        if found == None:
+            found = []
+
+        subid_clause = 'TRUE' if attnum == None else "d.refobjsubid = {0}".format(attnum)
+
+        sql = """
+            WITH dependent AS
+            (
+                SELECT DISTINCT
+                    CASE WHEN d.classid = 'pg_rewrite'::REGCLASS THEN 'pg_class'::REGCLASS::OID ELSE d.classid END AS classid,
+                    CASE WHEN d.classid = 'pg_rewrite'::REGCLASS THEN r.ev_class ELSE d.objid END                AS objid
+                FROM
+                    pg_depend d
+                        LEFT JOIN pg_rewrite r ON
+                            d.classid = 'pg_rewrite'::REGCLASS AND
+                            r.oid = d.objid
+                WHERE
+                    d.refclassid = '{0}'::REGCLASS AND
+                    d.refobjid = {1} AND
+                    {2} AND
+                    d.deptype = 'n'
+            )
+            SELECT
+                i.type,
+                i.identity,
+                dependent.classid::REGCLASS::TEXT,
+                dependent.objid
+            FROM
+                dependent,
+                LATERAL pg_identify_object(dependent.classid,dependent.objid,0) i
+            WHERE
+                NOT (dependent.classid = '{0}'::REGCLASS AND dependent.objid = {1})
+            ORDER BY
+                1,2
+        """.format(classid,objid,subid_clause)
+
+        with self._db_connection.cursor() as cursor:
+            cursor.execute(sql)
+            rows = cursor.fetchall()
+
+        for (type,identity,dep_classid,dep_objid) in rows:
+            if (type,identity) in found:
+                continue
+
+            #   Whatever depends on this dependent has to go first
+            self.dependents(dep_classid,dep_objid,None,found)
+
+            if (type,identity) not in found:
+                found.append((type,identity))
+
+        return found
+
+
+    #   Return the dependents (see dependents()) of column 'column_name' of
+    #   table 'schema.table'. An unknown table or column has no dependents.
+    def column_dependents(self,table_name,column_name):
+        sql = """
+            SELECT
+                attrelid,
+                attnum
+            FROM
+                pg_attribute
+            WHERE
+                attrelid = to_regclass('{0}') AND
+                attname = '{1}' AND
+                NOT attisdropped
+        """.format(db.escape_quotes(table_name),db.escape_quotes(column_name))
+
+        with self._db_connection.cursor() as cursor:
+            cursor.execute(sql)
+            column = cursor.fetchone()
+
+        if column == None:
+            return []
+
+        return self.dependents('pg_class',column[0],column[1])
+
+
+    #   Return the oids of every routine (all overloads) named 'schema.name'.
+    #   An argument list following the name is ignored.
+    def routine_oids(self,routine_name):
+        name = routine_name.split('(')[0].strip().replace('"','')
+
+        if name.find('.') != -1:
+            (schema,name) = name.split('.',1)
+        else:
+            schema = 'public'
+
+        sql = """
+            SELECT
+                p.oid
+            FROM
+                pg_proc p
+                    JOIN pg_namespace n ON
+                        n.oid = p.pronamespace
+            WHERE
+                n.nspname = '{0}' AND
+                p.proname = '{1}'
+        """.format(db.escape_quotes(schema),db.escape_quotes(name))
+
+        with self._db_connection.cursor() as cursor:
+            cursor.execute(sql)
+            rows = cursor.fetchall()
+
+        return [ row[0] for row in rows ]
+
+
+    #   Return the dependents (see dependents()) of the routine(s) named
+    #   'schema.name' -- all overloads, as the deployer drops by name.
+    def routine_dependents(self,routine_name):
+        found = []
+
+        for oid in self.routine_oids(routine_name):
+            self.dependents('pg_proc',oid,None,found)
+
+        return found
+
+
     def change_db(self,new_db_name):
         self._target_db_name=new_db_name
         self._construct_db_parameter()

@@ -42,6 +42,10 @@ DIRECTORY_TYPE_ALIAS = {
 }
 
 
+#	Matches an ALTER TABLE statement that adds a foreign key constraint.
+FOREIGN_KEY_PATTERN = re.compile(r'^\s*ALTER\s+TABLE\b.*\bFOREIGN\s+KEY\b',re.IGNORECASE | re.DOTALL)
+
+
 #	Returns True when an object type parsed from a file matches the type
 #	implied by the directory the file lives in.
 def type_matches_directory(directory_type, object_type):
@@ -51,6 +55,122 @@ def type_matches_directory(directory_type, object_type):
 def errorExit(error):
     print("An error has occurred: '{0}'".format(error))
     sys.exit(-1)
+
+
+#	Reduce an object identity to a comparable form: unquoted, single-spaced,
+#	lower case. Both pg_identify_object() output and repository parsing go
+#	through this, so quoting differences between the two do not matter.
+def normalize_identity(identity):
+    return re.sub(r'\s+',' ',identity.replace('"','')).strip().lower()
+
+
+#	Index of the objects defined in the repository, keyed by the kind and
+#	identity that pg_identify_object() reports for them, so that an object
+#	the database says depends on something can be traced back to the file
+#	that defines it. Routines are keyed by name only -- overloads all match.
+class repo_index:
+
+    def __init__(self,list):
+        self._entries = {}
+
+        for path in sorted(list):
+            type = list[path]
+            file = sqlfile(path)
+
+            if type == 'view':
+                name = file.object_name()
+                kind = 'materialized view' if file.object_sub_type() == 'materialized' else 'view'
+                self._add(kind,name,path,type)
+
+            elif type in ['function','procedure']:
+                self._add(file.object_type(),file.object_name().split('(')[0],path,type)
+
+            elif type in ['data','post_deployment']:
+                for (policy,table) in file.policy_definitions():
+                    self._add('policy',"{0} on {1}".format(policy,table),path,type)
+                for (trigger,table) in file.trigger_definitions():
+                    self._add('trigger',"{0} on {1}".format(trigger,table),path,type)
+
+            if type in ['index','table']:
+                #   An index lives in the schema of its table
+                for (index,table) in file.index_definitions():
+                    if index != '' and table.find('.') != -1:
+                        self._add('index',table.split('.')[0] + '.' + index,path,type)
+
+
+    def _add(self,kind,identity,path,type):
+        key = (kind,normalize_identity(identity))
+
+        if key not in self._entries:
+            self._entries[key] = []
+
+        self._entries[key].append((path,type))
+
+
+    #	Return the [(path,type)] list of files defining the object, or [].
+    def lookup(self,kind,identity):
+        if kind in ['function','procedure']:
+            identity = identity.split('(')[0]
+            #   A procedure may live in the function directory and vice versa
+            return self._entries.get(('function',normalize_identity(identity)),[]) + \
+                   self._entries.get(('procedure',normalize_identity(identity)),[])
+
+        return self._entries.get((kind,normalize_identity(identity)),[])
+
+
+#	Prepare the removal of everything that depends on 'subject' (used in
+#	messages only), so that the subject itself can be dropped without CASCADE.
+#	'dependents' is what db.dependents() returned: (kind,identity) tuples in
+#	drop order. Every one of them must be defined in the repository -- the run
+#	is aborted otherwise, so that nothing outside the repository ever gets
+#	dropped. Returns a (pre_script,post_script) pair: pre_script drops the
+#	dependents and goes before the drop of the subject; post_script recreates
+#	those that no later pass will take care of and goes after it. A dependent
+#	whose object type is processed later in this run is flagged as changed
+#	instead, and its own pass recreates it.
+def resolve_dependents(cache,repo,current_type,subject,dependents):
+    pre_script = []
+    post_script = []
+    missing = []
+
+    for (kind,identity) in dependents:
+        definitions = repo.lookup(kind,identity)
+
+        if len(definitions) == 0:
+            missing.append("{0} {1}".format(kind,identity))
+            continue
+
+        pre_script.append("DROP {0} IF EXISTS {1};".format(kind.upper(),identity))
+
+        for (path,type) in definitions:
+            print("\t\tDropping dependent {0} {1} -- recreated from {2}".format(kind,identity,basename(path)))
+
+            if SUPPORTED_OBJECTS.index(type) > SUPPORTED_OBJECTS.index(current_type):
+                cache.set_file_changed(path)
+
+            else:
+                #   Its pass has already run (or is running): recreate it here
+                file = sqlfile(path)
+                file.object_type()  #   strips OR REPLACE where applicable
+
+                if kind == 'index':
+                    statement = find_index_statement(file,normalize_identity(identity).split('.')[-1])
+                    if statement == None:
+                        missing.append("{0} {1}".format(kind,identity))
+                    else:
+                        post_script.append(statement)
+
+                elif kind in ['function','procedure']:
+                    post_script.extend(sqlpreprocessor.preprocess(file.contents()))
+
+                else:
+                    missing.append("{0} {1}".format(kind,identity))
+
+    if len(missing) > 0:
+        errorExit("cannot drop {0}, the following dependents are not defined in the repository:\n\t{1}".format(
+            subject,"\n\t".join(missing)))
+
+    return pre_script,post_script
 
 
 def process_database_change(db,file):
@@ -80,7 +200,7 @@ def find_index_statement(file, index_name):
     return None
 
 
-def process_table_changes(db, file, verbose_flag=None):
+def process_table_changes(db, cache, repo, file, verbose_flag=None):
     change_script = []
 
     #	add _tmp to table name
@@ -97,7 +217,13 @@ def process_table_changes(db, file, verbose_flag=None):
     drop_table_SQL = "DROP TABLE IF EXISTS " + tmp_file.object_name() + ' CASCADE;'
     SQL = []
     SQL.append(drop_table_SQL)
-    SQL.extend(tmp_file.contents())
+    
+    #   Leave foreign keys out of the tmp table: it only exists to diff columns
+    #   and indexes, and the table it references may be new in this deployment,
+    #   in which case its CREATE is still waiting in the change script.
+    for statement in tmp_file.contents():
+        if FOREIGN_KEY_PATTERN.match(statement) == None:
+            SQL.append(statement)
 
     if verbose_flag:
         print(f"process_table_changes:sql=\n{SQL}")
@@ -119,8 +245,15 @@ def process_table_changes(db, file, verbose_flag=None):
     for field in all_fields:
         if field in org_def and field not in tmp_def:
             print("\t\tRemoving column {0}".format(field))
+
+            #   Whatever depends on the column goes first, and is recreated after
+            (pre_script,post_script) = resolve_dependents(cache,repo,'table',
+                "column {0}.{1}".format(org_table,field),
+                db.column_dependents(org_table,field))
+            change_script.extend(pre_script)
             change_script.append("ALTER TABLE {0} DROP COLUMN {1};".format(
                 org_table, field))
+            change_script.extend(post_script)
 
         if field not in org_def and field in tmp_def:
             print("\t\tAdding column {0}".format(field))
@@ -254,11 +387,17 @@ def strip_argument_defaults(signature):
     return "{0}({1}){2}".format(signature[:open_position],', '.join(stripped),signature[close_position + 1:])
 
 
-def process_function_change(db, file):
+def process_function_change(db, cache, repo, file):
     change_script = []
 
     #   Strip DEFAULT clauses from parameters
     function_header = strip_argument_defaults(file.object_name())
+
+    #   Whatever depends on the function goes first, and is recreated after
+    (pre_script,post_script) = resolve_dependents(cache,repo,'function',
+        "function {0}".format(function_header),
+        db.routine_dependents(function_header))
+    change_script.extend(pre_script)
 
     change_script.append(
         "DROP FUNCTION IF EXISTS {0};".format(function_header))
@@ -267,15 +406,22 @@ def process_function_change(db, file):
 
     contents = sqlpreprocessor.preprocess(contents)
     change_script.extend(contents)
+    change_script.extend(post_script)
 
     return change_script
 
 
-def process_procedure_change(db, file):
+def process_procedure_change(db, cache, repo, file):
     change_script = []
 
     #   Strip DEFAULT clauses from parameters
     procedure_header = strip_argument_defaults(file.object_name())
+
+    #   Whatever depends on the procedure goes first, and is recreated after
+    (pre_script,post_script) = resolve_dependents(cache,repo,'procedure',
+        "procedure {0}".format(procedure_header),
+        db.routine_dependents(procedure_header))
+    change_script.extend(pre_script)
 
     change_script.append(
         "DROP PROCEDURE IF EXISTS {0};".format(procedure_header))
@@ -284,6 +430,7 @@ def process_procedure_change(db, file):
 
     contents = sqlpreprocessor.preprocess(contents)
     change_script.extend(contents)
+    change_script.extend(post_script)
 
     return change_script
 
@@ -322,12 +469,19 @@ def process_data_change(db, file):
     change_script = []
 
     #   A policy cannot be created with OR REPLACE, so drop it first to make
-    #   the file re-runnable. Everything else is passed through untouched.
+    #   the file re-runnable. The same for triggers, as not every PostgreSQL
+    #   version accepts OR REPLACE there. Everything else is passed through
+    #   untouched.
     contents = []
     for statement in file.contents():
         policy_header = sqlfile.parse_policy_header(statement)
         if policy_header != None:
             contents.append("DROP POLICY IF EXISTS {0} ON {1};".format(policy_header[0],policy_header[1]))
+
+        trigger_header = sqlfile.parse_trigger_header(statement)
+        if trigger_header != None:
+            contents.append("DROP TRIGGER IF EXISTS {0} ON {1};".format(trigger_header[0],trigger_header[1]))
+
         contents.append(statement)
 
     contents = sqlpreprocessor.preprocess(contents)
@@ -390,6 +544,9 @@ def process_objects(db, cache, list, force_flag, dev_flag, verbose_flag):
     dependency = {}
     manifest_file_processed = []
     dependency_file_processed = []
+
+    #   Everything the repository defines, for tracing database dependents back to their files
+    repo = repo_index(list)
 
     for type in SUPPORTED_OBJECTS:
         print("Processing {0}:".format(type))
@@ -556,15 +713,15 @@ def process_objects(db, cache, list, force_flag, dev_flag, verbose_flag):
                         else:
                             #	process changes -- table only, as there are no attributes to change for schemas
                             if (file.object_type() == 'table'):
-                                change_script = change_script + process_table_changes(db,file,verbose_flag)
+                                change_script = change_script + process_table_changes(db,cache,repo,file,verbose_flag)
 
                     elif (file.object_type() == 'function'):
                         change_script = change_script + process_function_change(
-                            db, file)
+                            db, cache, repo, file)
 
                     elif (file.object_type() == 'procedure'):
                         change_script = change_script + process_procedure_change(
-                            db, file)
+                            db, cache, repo, file)
 
                     elif (file.object_type() in ['view', 'datacube']):
                         change_script = change_script + process_view_change(
