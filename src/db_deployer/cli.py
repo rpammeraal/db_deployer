@@ -217,7 +217,7 @@ def process_table_changes(db, cache, repo, file, verbose_flag=None):
     drop_table_SQL = "DROP TABLE IF EXISTS " + tmp_file.object_name() + ' CASCADE;'
     SQL = []
     SQL.append(drop_table_SQL)
-    
+
     #   Leave foreign keys out of the tmp table: it only exists to diff columns
     #   and indexes, and the table it references may be new in this deployment,
     #   in which case its CREATE is still waiting in the change script.
@@ -258,18 +258,45 @@ def process_table_changes(db, cache, repo, file, verbose_flag=None):
         if field not in org_def and field in tmp_def:
             print("\t\tAdding column {0}".format(field))
 
+            default = tmp_def[field].default()
+            not_null = (tmp_def[field].nullable_flag() == 0)
+
+            if default != None and re.search(r'\btmp\.',default) != None:
+                #   A serial column: its default points at a sequence owned by
+                #   the tmp table, which is about to be dropped.
+                errorExit("column {0}.{1} has default {2}, which refers to the tmp schema. Create the sequence explicitly instead of using a serial type.".format(
+                    org_table,field,default))
+
             default_clause = ''
-            if (tmp_def[field].default() != None):
-                default_clause = 'DEFAULT {0}'.format(tmp_def[field].default())
+            if default != None:
+                default_clause = 'DEFAULT {0}'.format(default)
 
-            not_null_clause = 'NULL'
-            if (tmp_def[field].nullable_flag == 0):
-                not_null_clause = 'NOT NULL'
+            if not_null and default != None:
+                #   Add the column as nullable, fill whatever is still empty
+                #   with the default, and only then tighten it.
+                change_script.append(
+                    "ALTER TABLE {0} ADD COLUMN {1} {2} NULL {3};".format(
+                        org_table, field, tmp_def[field].type(), default_clause))
+                change_script.append(
+                    "UPDATE {0} SET {1} = {2} WHERE {1} IS NULL;".format(
+                        org_table, field, default))
+                change_script.append(
+                    "ALTER TABLE {0} ALTER COLUMN {1} SET NOT NULL;".format(
+                        org_table, field))
 
-            change_script.append(
-                "ALTER TABLE {0} ADD COLUMN {1} {2} {3} {4};".format(
-                    org_table, field, tmp_def[field].type(), not_null_clause,
-                    default_clause))
+            else:
+                if not_null:
+                    print("")
+                    print("\t\t****************************************************************")
+                    print("\t\t*  WARNING: column {0}.{1} is NOT NULL without a DEFAULT.".format(org_table,field))
+                    print("\t\t*  Adding it fails when the table contains rows.")
+                    print("\t\t****************************************************************")
+                    print("")
+
+                change_script.append(
+                    "ALTER TABLE {0} ADD COLUMN {1} {2} {3} {4};".format(
+                        org_table, field, tmp_def[field].type(),
+                        'NOT NULL' if not_null else 'NULL', default_clause))
 
     #	Examine changes in indexes
     org_table_index = {}
