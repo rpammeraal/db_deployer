@@ -468,7 +468,7 @@ class db:
                     a.attname AS column_name,
                     pg_catalog.format_type(a.atttypid, a.atttypmod) AS type_name,
                     a.attnotnull::INT AS is_nullable,
-                    NULL AS column_default,
+                    pg_get_expr(ad.adbin,ad.adrelid) AS column_default,
                     a.attnum::INT AS ordinal_position,
                     i.indisprimary  AS is_primary_key
                 FROM pg_attribute a
@@ -479,6 +479,9 @@ class db:
                     LEFT JOIN pg_index i ON
                         a.attrelid = i.indrelid AND
                         a.attnum = ANY(i.indkey)
+                    LEFT JOIN pg_attrdef ad ON
+                        ad.adrelid = a.attrelid AND
+                        ad.adnum = a.attnum
                 WHERE 
                     s.nspname || '.' || t.relname = '{0}' AND 
                     a.attnum > 0 AND 
