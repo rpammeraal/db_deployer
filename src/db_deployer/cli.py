@@ -1569,6 +1569,10 @@ def main(argv=None):
 
     main_db_path = repo_path + '/database'
 
+    if not os.path.isdir(main_db_path):
+        print("No database directory found in {0}. Use --repo to point at the repository root, the directory containing database/.".format(os.path.abspath(repo_path)))
+        sys.exit(-1)
+
     #   Collect databases in repo
     all_databases = {}
     for f_entry in os.listdir(main_db_path):
