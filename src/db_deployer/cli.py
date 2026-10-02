@@ -29,6 +29,15 @@ from .lib.cache import cache
 from .lib.sqlfile import sqlfile
 from .lib.sqlpreprocessor import sqlpreprocessor
 
+#	Environment variable naming the deployment environment (dev, prod, ...)
+#	when --env is not given.
+ENV_ENVIRONMENT = 'DB_DEPLOYER_ENV'
+
+#	Object types whose directory may hold one subdirectory per environment:
+#	data/dev/, data/prod/, ... Only the subdirectory matching the current
+#	environment is deployed, next to the files in the directory itself.
+ENVIRONMENT_OBJECTS = [ 'data' ]
+
 SUPPORTED_OBJECTS = [ 'role', 'database', 'schema', 'table', 'function', 'procedure', 'view', 'data', 'index', 'privilege', 'post_deployment' ]
 
 #	Object types that may share a directory: PostgreSQL routines are
@@ -849,11 +858,12 @@ def execute_post_deployment(current_db,post_script,verbose_flag):
         errorExit(result)
 
 
-def process_files(repo_path, cache, files, database_name, force_flag, verbose_flag, dev_flag):
+def process_files(repo_path, cache, files, database_name, environment, force_flag, verbose_flag, dev_flag):
 
     db_path = repo_path + '/database/' + database_name
 
     objects = {}
+    skipped_environments = []
     for name in files:
         if name.startswith('.'):
             continue
@@ -865,11 +875,22 @@ def process_files(repo_path, cache, files, database_name, force_flag, verbose_fl
         type = p[2].lower()
         if p[0] == 'database' and p[1].lower() == database_name.lower():
             if (type in SUPPORTED_OBJECTS):
+                if type in ENVIRONMENT_OBJECTS and len(p) > 4:
+                    #   <type>/<environment>/...: only the current environment's files
+                    environment_found = p[3]
+                    if environment == None or environment_found.lower() != environment.lower():
+                        if environment_found not in skipped_environments:
+                            skipped_environments.append(environment_found)
+                        continue
+
                 path = repo_path + "/" + name
                 objects[path] = (type)
             else:
                 print("type {0} NOT SUPPORTED YET!".format(type))
                 sys.exit()
+
+    if len(skipped_environments) > 0:
+        print("Skipping files for environment(s): {0}".format(', '.join(sorted(skipped_environments))))
 
     #   Directory name = postgres database name
     current_db = db(database=database_name)
@@ -879,7 +900,7 @@ def process_files(repo_path, cache, files, database_name, force_flag, verbose_fl
     #   connect there to run CREATE ROLE / CREATE DATABASE, not for schema work.
     if database_name not in ('postgres','template1'):
         current_db.create_tmp_schema()
-    print("Deploying on {0}@{1}:".format(current_db.db_name(),current_db.host()))
+    print("Deploying on {0}@{1} (environment: {2}):".format(current_db.db_name(),current_db.host(),environment if environment != None else 'none'))
 
     change_script = []
     change_script.append("--	START OF CHANGESCRIPT on " + database_name)
@@ -954,6 +975,7 @@ def main(argv=None):
     #	Set up parser
     parser = argparse.ArgumentParser(prog='db_deployer',description='Deploy changed or new files to your sandbox database')
     parser.add_argument('--repo',help="path to SQL repo (overrides $DB_DEPLOYER_REPO)")
+    parser.add_argument('--env',help="deployment environment, selects data/<env>/ (overrides $DB_DEPLOYER_ENV)")
     parser.add_argument('--db',help="comma separated list of databases")
     parser.add_argument('--dev',action="store_true",help="only deploys changed files")
     parser.add_argument('--rebuild_cache',action="store_true",help="rebuild cache")
@@ -969,9 +991,21 @@ def main(argv=None):
     run_flag = args.run
 
     repo_path = args.repo if args.repo is not None else os.environ.get(constants._ENV_REPO)
+    environment = args.env if args.env is not None else os.environ.get(ENV_ENVIRONMENT)
     if repo_path is None:
         print(f"Repo path not set. Use --repo or export {constants._ENV_REPO}.")
         sys.exit(-1)
+
+    if environment != None:
+        print("Environment: {0}".format(environment))
+    else:
+        print("")
+        print("****************************************************************")
+        print("*  WARNING: no environment set.")
+        print("*  Environment-specific files (data/<env>/) are NOT deployed.")
+        print("*  Use --env or export {0}.".format(ENV_ENVIRONMENT))
+        print("****************************************************************")
+        print("")
 
     i_did_something = False
     my_cache = cache(repo_path)
@@ -1031,7 +1065,7 @@ def main(argv=None):
         all_files.sort()
 
         if run_flag == True:
-            process_files(repo_path,my_cache,all_files,current_db,0,verbose_flag,dev_flag)
+            process_files(repo_path,my_cache,all_files,current_db,environment,0,verbose_flag,dev_flag)
             i_did_something = True
 
     if i_did_something == False:
