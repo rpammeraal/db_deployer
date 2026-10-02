@@ -54,103 +54,216 @@ class db:
         return db(database=database,host=host,port=port,user=user,password=password,autocommit=autocommit)
 
 
-    def all_index_definitions(self, table_name):
-        sql = """
-            WITH indexDef AS
-            (
-                SELECT
-                    idx.indrelid::REGCLASS::VARCHAR             AS table_name,
-                    i.relname                                   AS index_name,
-                    idx.indisunique::INT::VARCHAR               AS is_unique,
-                    am.amname                                   AS index_type,
-                    ARRAY
-                    (
-                        SELECT 
-                            pg_get_indexdef(idx.indexrelid, k + 1, TRUE)
-                        FROM
-                            generate_subscripts(idx.indkey, 1)  AS k
-                        ORDER BY 
-                            k
-                    )::VARCHAR                                  AS index_keys,
-                    ((idx.indexprs IS NOT NULL) OR (idx.indkey::int[] @> array[0]))::INT::VARCHAR 
-                                                                AS is_functional,
-                    (idx.indpred IS NOT NULL)::INT::VARCHAR     AS is_partial
-                FROM 
-                    pg_index AS idx
-                        JOIN pg_class i ON 
-                            i.oid = idx.indexrelid
-                        JOIN pg_am am ON 
-                            i.relam = am.oid
-                        JOIN pg_namespace NS ON 
-                            i.relnamespace = NS.OID
-                        JOIN pg_user U ON 
-                            i.relowner = U.usesysid
-                WHERE 
-                    idx.indrelid :: REGCLASS :: VARCHAR ILIKE '{0}'
-            )
-            SELECT
-                index_name,
-                index_type || ':' || index_keys || ':' ||is_functional || ':' || is_partial 
-            FROM
-                indexDef
-            WHERE
-                table_name='{0}'
-        """.format(table_name)
+    #   Split 'schema.name' into its parts; a bare name lives in public.
+    @staticmethod
+    def split_name(name):
+        name = name.replace('"','')
+        if name.find('.') != -1:
+            return tuple(name.split('.',1))
+        return ('public',name)
 
-        table_name='datacheck_daily_discrepancy_result'
+
+    #   Return {index_name: definition} for every index on 'schema.table' that
+    #   does not back a constraint (those are reported by
+    #   all_constraint_definitions()). The definition is what pg_get_indexdef()
+    #   returns, so it includes the (schema-qualified) table name.
+    def all_index_definitions(self, table_name):
+        (schema,table) = db.split_name(table_name)
+
         sql = """
-            SELECT DISTINCT
-                --n.nspname as schema_name,
-                --t.relname as table_name,
-                i.relname as index_name,
-                c.contype as index_type,
-                a.attname as column_name
+            SELECT
+                i.relname,
+                pg_get_indexdef(ix.indexrelid)
             FROM
-                pg_class t
-                    INNER JOIN pg_index ix ON
+                pg_index ix
+                    JOIN pg_class t ON
                         t.oid = ix.indrelid
-                    INNER JOIN pg_constraint c ON
-                        ix.indrelid = c.conrelid
-                    INNER JOIN pg_class i ON
+                    JOIN pg_class i ON
                         i.oid = ix.indexrelid
-                    INNER JOIN pg_attribute a ON
-                        a.attrelid = t.oid AND
-                        a.attnum= ANY(string_to_array(textin(int2vectorout(ix.indkey)),' ')::int[])
-                    INNER JOIN pg_namespace n ON
+                    JOIN pg_namespace n ON
                         n.oid = t.relnamespace
             WHERE
-                t.relname='{0}'
+                n.nspname = '{0}' AND
+                t.relname = '{1}' AND
+                NOT EXISTS
+                (
+                    SELECT NULL FROM pg_constraint c WHERE c.conindid = ix.indexrelid AND c.conrelid = ix.indrelid
+                )
             ORDER BY
-                 1,2,3
-        """.format(table_name)
+                1
+        """.format(db.escape_quotes(schema),db.escape_quotes(table))
+
+        defs = {}
+        with self._db_connection.cursor() as cursor:
+            cursor.execute(sql)
+            for (index_name,definition) in cursor.fetchall():
+                defs[index_name] = definition
+
+        return defs
+
+
+    #   Return {constraint_name: (type,definition)} for every constraint on
+    #   'schema.table'. Not-null constraints (PostgreSQL 18 lists those here
+    #   too) are left out: nullability is compared per column.
+    def all_constraint_definitions(self, table_name):
+        (schema,table) = db.split_name(table_name)
+
+        sql = """
+            SELECT
+                c.conname,
+                c.contype,
+                pg_get_constraintdef(c.oid,TRUE)
+            FROM
+                pg_constraint c
+                    JOIN pg_class t ON
+                        t.oid = c.conrelid
+                    JOIN pg_namespace n ON
+                        n.oid = t.relnamespace
+            WHERE
+                n.nspname = '{0}' AND
+                t.relname = '{1}' AND
+                c.contype <> 'n'
+            ORDER BY
+                1
+        """.format(db.escape_quotes(schema),db.escape_quotes(table))
+
+        defs = {}
+        with self._db_connection.cursor() as cursor:
+            cursor.execute(sql)
+            for (name,type,definition) in cursor.fetchall():
+                defs[name] = (type,definition)
+
+        return defs
+
+
+    #   Return the relkind ('r' table, 'v' view, 'm' materialized view, ...)
+    #   of 'schema.name', or None when there is no such relation.
+    def relation_kind(self,name):
+        sql = "SELECT relkind FROM pg_class WHERE oid = to_regclass('{0}')".format(db.escape_quotes(name))
 
         with self._db_connection.cursor() as cursor:
             cursor.execute(sql)
+            row = cursor.fetchone()
 
-            index_defs = {}
-            index_cols = {}
-            index_def = cursor.fetchone()
-            while (index_def != None):
-                index_name=index_def[0]
-                index_type=index_def[1]
-                column_name=index_def[2]
+        return None if row == None else row[0]
 
-                if index_name not in index_defs.keys():
-                    column = []
-                    column.append(column_name)
-                    index_cols[index_name]=column 
-                    index_defs[index_name]=index_type
-                else:
-                    index_cols[index_name].append(column_name)
 
-                index_def = cursor.fetchone()
+    #   Return the query behind view 'schema.name' as pg_get_viewdef() prints
+    #   it, or None when there is no such view.
+    def view_definition(self,name):
+        sql = "SELECT pg_get_viewdef(to_regclass('{0}'),TRUE)".format(db.escape_quotes(name))
+
+        with self._db_connection.cursor() as cursor:
+            cursor.execute(sql)
+            row = cursor.fetchone()
+
+        return None if row == None else row[0]
+
+
+    #   Return the dependents (see dependents()) of relation 'schema.name'.
+    def relation_dependents(self,name):
+        sql = "SELECT to_regclass('{0}')::OID".format(db.escape_quotes(name))
+
+        with self._db_connection.cursor() as cursor:
+            cursor.execute(sql)
+            row = cursor.fetchone()
+
+        if row == None or row[0] == None:
+            return []
+
+        return self.dependents('pg_class',row[0])
+
+
+    #   Return [(oid,prokind,identity_arguments)] for every routine (all
+    #   overloads) named 'schema.name'. An argument list following the name
+    #   is ignored.
+    def routine_signatures(self,routine_name):
+        (schema,name) = db.split_name(routine_name.split('(')[0].strip())
+
+        sql = """
+            SELECT
+                p.oid,
+                p.prokind,
+                pg_get_function_identity_arguments(p.oid)
+            FROM
+                pg_proc p
+                    JOIN pg_namespace n ON
+                        n.oid = p.pronamespace
+            WHERE
+                n.nspname = '{0}' AND
+                p.proname = '{1}'
+            ORDER BY
+                3
+        """.format(db.escape_quotes(schema),db.escape_quotes(name))
+
+        with self._db_connection.cursor() as cursor:
+            cursor.execute(sql)
+            rows = cursor.fetchall()
+
+        return [ (row[0],row[1],row[2]) for row in rows ]
+
+
+    #   Return the complete CREATE statement of the routine with oid 'oid'.
+    def routine_definition(self,oid):
+        sql = "SELECT pg_get_functiondef({0})".format(oid)
+
+        with self._db_connection.cursor() as cursor:
+            cursor.execute(sql)
+            row = cursor.fetchone()
+
+        return None if row == None else row[0]
+
+
+    #   Return {policy_name: (command,permissive,roles,using,with_check)} for
+    #   every row level security policy on 'schema.table'.
+    def policy_definitions(self,table_name):
+        sql = """
+            SELECT
+                p.polname,
+                p.polcmd,
+                p.polpermissive,
+                ARRAY(SELECT r.rolname FROM pg_roles r WHERE r.oid = ANY(p.polroles) ORDER BY 1)::TEXT,
+                pg_get_expr(p.polqual,p.polrelid,TRUE),
+                pg_get_expr(p.polwithcheck,p.polrelid,TRUE)
+            FROM
+                pg_policy p
+            WHERE
+                p.polrelid = to_regclass('{0}')
+            ORDER BY
+                1
+        """.format(db.escape_quotes(table_name))
 
         defs = {}
-        for index_name in index_defs.keys():
-            index_type=index_defs[index_name]
-            index_columns=index_cols[index_name]
+        with self._db_connection.cursor() as cursor:
+            cursor.execute(sql)
+            for row in cursor.fetchall():
+                defs[row[0]] = (row[1],row[2],row[3],row[4],row[5])
 
-            defs[index_name]=index_type+':'+','.join(index_columns)
+        return defs
+
+
+    #   Return {trigger_name: definition} for every user trigger on
+    #   'schema.table', as pg_get_triggerdef() prints it.
+    def trigger_definitions(self,table_name):
+        sql = """
+            SELECT
+                t.tgname,
+                pg_get_triggerdef(t.oid,TRUE)
+            FROM
+                pg_trigger t
+            WHERE
+                t.tgrelid = to_regclass('{0}') AND
+                NOT t.tgisinternal
+            ORDER BY
+                1
+        """.format(db.escape_quotes(table_name))
+
+        defs = {}
+        with self._db_connection.cursor() as cursor:
+            cursor.execute(sql)
+            for (name,definition) in cursor.fetchall():
+                defs[name] = definition
+
         return defs
 
 
@@ -244,30 +357,7 @@ class db:
     #   Return the oids of every routine (all overloads) named 'schema.name'.
     #   An argument list following the name is ignored.
     def routine_oids(self,routine_name):
-        name = routine_name.split('(')[0].strip().replace('"','')
-
-        if name.find('.') != -1:
-            (schema,name) = name.split('.',1)
-        else:
-            schema = 'public'
-
-        sql = """
-            SELECT
-                p.oid
-            FROM
-                pg_proc p
-                    JOIN pg_namespace n ON
-                        n.oid = p.pronamespace
-            WHERE
-                n.nspname = '{0}' AND
-                p.proname = '{1}'
-        """.format(db.escape_quotes(schema),db.escape_quotes(name))
-
-        with self._db_connection.cursor() as cursor:
-            cursor.execute(sql)
-            rows = cursor.fetchall()
-
-        return [ row[0] for row in rows ]
+        return [ signature[0] for signature in self.routine_signatures(routine_name) ]
 
 
     #   Return the dependents (see dependents()) of the routine(s) named
