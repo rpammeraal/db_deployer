@@ -232,6 +232,30 @@ class sqlfile:
         return (match.group('trigger'),match.group('table'))
 
 
+    #	Return 'statement' with the table of its CREATE POLICY clause replaced
+    #	by 'new_table'. Returns None when the statement does not create a policy.
+    @staticmethod
+    def rewrite_policy_table(statement,new_table):
+        statement = statement.strip()
+        match = POLICY_HEADER_PATTERN.match(statement)
+        if match == None:
+            return None
+
+        return statement[:match.start('table')] + new_table + statement[match.end('table'):]
+
+
+    #	Return 'statement' with the table of its CREATE TRIGGER clause replaced
+    #	by 'new_table'. Returns None when the statement does not create a trigger.
+    @staticmethod
+    def rewrite_trigger_table(statement,new_table):
+        statement = statement.strip()
+        match = TRIGGER_HEADER_PATTERN.match(statement)
+        if match == None:
+            return None
+
+        return statement[:match.start('table')] + new_table + statement[match.end('table'):]
+
+
     #	Return a (trigger_name,table_name) tuple for every trigger created in this file.
     def trigger_definitions(self):
         definitions = []

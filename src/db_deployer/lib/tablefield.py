@@ -10,6 +10,7 @@ class tablefield:
     def __init__(self, name, field_type, nullable_flag, default, is_primary_key=None):
         self._name = name
         self._type = field_type
+        self._raw_type = field_type
         self._nullable_flag = nullable_flag if nullable_flag != None else 0
         self._default = default
         if is_primary_key==None:
@@ -36,6 +37,12 @@ class tablefield:
 
     def type(self):
         return self._type
+
+
+    #	The type exactly as the catalog reports it, including any length or
+    #	precision (type() shortens 'character varying(n)' to 'varchar').
+    def raw_type(self):
+        return self._raw_type
 
 
     def nullable_flag(self):
