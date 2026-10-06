@@ -10,7 +10,6 @@ import pickle
 import time
 
 from . import constants
-from sqlalchemy import create_engine
 from .tablefield import tablefield
 from .util import util
 
@@ -408,6 +407,8 @@ class db:
 
 
     def engine(self):
+        #   SQLAlchemy is not a dependency of the deployer -- only loaded when asked for
+        from sqlalchemy import create_engine
         return create_engine(self.url())
 
 
