@@ -14,7 +14,7 @@ Requires Python 3.10+ and a target PostgreSQL server (any recent version). No cl
 
 ## Configuration
 
-`db_deployer` reads all configuration from environment variables and `~/.pgpass`. No config file.
+`db_deployer` reads its configuration from environment variables and `~/.pgpass`. The only file it reads is the optional `.db_deployer.alias` in the repository root (see [Database aliases](#database-aliases)).
 
 ### Environment variables
 
@@ -25,7 +25,7 @@ Requires Python 3.10+ and a target PostgreSQL server (any recent version). No cl
 | `PGHOST` | PostgreSQL host (standard libpq env) |
 | `PGPORT` | PostgreSQL port (default 5432) |
 | `PGUSER` | Connecting user |
-| `PGDATABASE` | Optional; if unset, iterate all directories under `<repo>/database/` |
+| `PGDATABASE` | Ignored: database names come from the directories under `<repo>/database/` (use `--db` to select) |
 
 The same `PG*` vars are read by `psql` and every other libpq-based tool, so you can share them across your workflow.
 
@@ -73,7 +73,7 @@ The SQL repo must follow this structure:
     ├── postgres/                     ← roles and databases are created from here
     │   ├── role/
     │   └── database/
-    ├── rock_dev/                     ← directory name = postgres database name
+    ├── rock_dev/                     ← directory name = postgres database name, unless aliased
     │   ├── schema/
     │   │   └── analytics.sql
     │   ├── table/
@@ -110,6 +110,8 @@ Files in `data/`, `privilege/` and `post_deployment/` are not parsed for an obje
 
 `data/` may contain one subdirectory per environment. `data/dev/` is deployed only with `--env dev` (or `DB_DEPLOYER_ENV=dev`); files directly in `data/` are deployed always. Without an environment set, db_deployer warns and deploys the common files only.
 
+To make a machine always deploy as production, set `DB_DEPLOYER_ENV=prod` in the shell profile of the user that deploys there. `--env` still overrides it for a single run.
+
 ### Ordering within an object type
 
 Within a single object type, db_deployer processes files alphabetically by default. Two optional per-directory files let you override or supplement that:
@@ -141,6 +143,26 @@ Dependencies are resolved before deploy. If a parent file has changed and is red
 
 Use `manifest.txt` for stable, explicit ordering (e.g. schemas that must exist before tables). Use `dependency.txt` for expressing real referential relationships that should trigger cascaded redeploys.
 
+### Database aliases
+
+A directory under `database/` normally deploys to the database of the same name. To deploy it to a different database — say a dedicated dev database for a `git worktree` — put a `.db_deployer.alias` file in the repository root:
+
+```
+# .db_deployer.alias -- this worktree's own databases
+my_product=my_product_dev_new_feature
+reporting=reporting_dev_new_feature
+```
+
+One `directory=database` per line; `#` starts a comment. Each directory may be aliased once, and must exist under `database/` — anything else aborts the run. Keep the file out of git (add it to `.gitignore`), so that every worktree has its own.
+
+With an alias in place:
+
+- `--run`, `--check` and `--fix` connect to the alias, and the change script is written to `/tmp/deploy.<alias>.<timestamp>.sql`.
+- In the `database/` and `privilege/` files, every `DATABASE <directory>` is renamed to the alias — `CREATE`, `ALTER`, `DROP ... IF EXISTS`, `COMMENT ON` and `GRANT ... ON DATABASE` alike — so deploying `postgres` creates the aliased database.
+- `--db` still takes the directory name: `--db my_product`, not `--db my_product_dev_new_feature`.
+
+Each run prints the aliases in effect before it starts. Use `--show_target` to check where a deployment would go.
+
 ## Usage
 
 ```
@@ -156,11 +178,29 @@ db_deployer --run --dry-run                  # show the change script, execute n
 db_deployer --db rock_dev --dev --run        # only files that have changed since last cache commit
 db_deployer --db rock_dev --rebuild_cache    # mark everything as up-to-date without deploying
 db_deployer --db rock_dev --verbose --run    # show SQL output during deployment
+db_deployer --show_target                    # show where a deployment would go
 ```
 
 Without `--run`, the tool exits without doing anything — a safety measure to prevent accidental deploys.
 
 The change script of every deployment is written to `/tmp/deploy.<database>.<timestamp>.sql`.
+
+### Showing the deployment target
+
+`--show_target` prints the repository, environment, host, port, user and every database a deployment would use, and where each value came from. It connects to nothing, and also works when `PGHOST` or `PGUSER` is missing, reporting what is not set:
+
+```
+Deployment target:
+	repository:   /home/roy/Projects/my_product  ($DB_DEPLOYER_REPO)
+	environment:  dev  ($DB_DEPLOYER_ENV)
+	host:         globe.local  ($PGHOST)
+	port:         5432  ($PGPORT not set -- default in db.py)
+	user:         roy  ($PGUSER)
+	database:     postgres  (/home/roy/Projects/my_product/database/postgres)  [password: /home/roy/.pgpass (default password file), line 2]
+	database:     my_product_dev_new_feature  (alias of /home/roy/Projects/my_product/database/my_product, from /home/roy/Projects/my_product/.db_deployer.alias)  [password: /home/roy/.pgpass (default password file), line 1]
+```
+
+`--db`, `--repo` and `--env` are honoured. The password source follows libpq: `$PGPASSWORD`, else the first matching line of `$PGPASSFILE` or `~/.pgpass`. When no line matches, or the file is ignored because its mode is looser than 0600, it says so. The password itself is never shown.
 
 ### Checking a database against the repository
 
@@ -180,13 +220,14 @@ Objects in the database that have no file in the repository at all are not repor
 |---|---|
 | `--repo PATH` | Override `$DB_DEPLOYER_REPO` |
 | `--env NAME` | Deployment environment, selects `data/NAME/`; overrides `$DB_DEPLOYER_ENV` |
-| `--db LIST` | Comma-separated list of database names to process |
+| `--db LIST` | Comma-separated list of database directories to process (directory names, not aliases) |
 | `--run` | Actually execute the deployment (required — otherwise dry) |
 | `--check` | Compare the database with the repository and report the differences |
 | `--fix` | Resolve the differences found by `--check` (implies `--check`) |
 | `--dry-run` | With `--run` or `--fix`: print what would be executed, execute nothing |
 | `--dev` | Only deploy files that have changed since the last cache commit |
 | `--rebuild_cache` | Mark all files as up-to-date without deploying anything |
+| `--show_target` | Show the database(s), host, port, user and password source a deployment would use, and where each came from; connects to nothing |
 | `--verbose` | Show SQL output during deployment |
 | `-h`, `--help` | Show help |
 
