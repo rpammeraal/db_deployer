@@ -22,6 +22,7 @@ import copy
 import datetime
 import time
 import re
+import stat
 
 from .lib.db import db
 from .lib import constants
@@ -32,6 +33,11 @@ from .lib.sqlpreprocessor import sqlpreprocessor
 #	Environment variable naming the deployment environment (dev, prod, ...)
 #	when --env is not given.
 ENV_ENVIRONMENT = 'DB_DEPLOYER_ENV'
+
+#	File in the repository root mapping database directories to the database
+#	deployed to, one 'directory=database' per line: a worktree can deploy
+#	database/my_product to my_product_dev_new_feature. Not meant for git.
+ALIAS_FILENAME = '.db_deployer.alias'
 
 #	Object types whose directory may hold one subdirectory per environment:
 #	data/dev/, data/prod/, ... Only the subdirectory matching the current
@@ -64,6 +70,53 @@ def type_matches_directory(directory_type, object_type):
 def errorExit(error):
     print("An error has occurred: '{0}'".format(error))
     sys.exit(-1)
+
+
+#	Return ({directory: database},path) as read from the alias file in the
+#	repository root; an empty map when there is no such file. Every
+#	directory must exist under database/.
+def read_aliases(repo_path):
+    aliases = {}
+    path = repo_path + '/' + ALIAS_FILENAME
+
+    if not os.path.isfile(path):
+        return (aliases,path)
+
+    with open(path,'r') as f:
+        line_number = 0
+        for line in f:
+            line_number = line_number + 1
+            line = line.split('#',1)[0].strip()
+            if line == '':
+                continue
+
+            parts = [ part.strip() for part in line.split('=') ]
+            if len(parts) != 2 or parts[0] == '' or parts[1] == '':
+                errorExit("{0}, line {1}: expected 'directory=database'".format(path,line_number))
+
+            (directory,database) = parts
+            if not os.path.isdir(repo_path + '/database/' + directory):
+                errorExit("{0}, line {1}: there is no directory database/{2}".format(path,line_number,directory))
+            if directory in aliases:
+                errorExit("{0}, line {1}: database/{2} is aliased more than once".format(path,line_number,directory))
+
+            aliases[directory] = database
+
+    return (aliases,path)
+
+
+#	Return 'statements' with every 'DATABASE <directory>' that names an
+#	aliased database directory renamed to its alias: CREATE, ALTER, DROP,
+#	COMMENT ON and GRANT ... ON DATABASE alike.
+def apply_database_aliases(statements,aliases):
+    result = []
+    for statement in statements:
+        for (directory,database) in aliases.items():
+            pattern = r'(\bDATABASE\s+(?:IF\s+(?:NOT\s+)?EXISTS\s+)?)"?' + re.escape(directory) + r'"?(?![\w$])'
+            statement = re.sub(pattern,lambda m: m.group(1) + database,statement,flags=re.IGNORECASE)
+        result.append(statement)
+
+    return result
 
 
 #	Reduce an object identity to a comparable form: unquoted, single-spaced,
@@ -233,21 +286,6 @@ def resolve_dependents(cache,repo,current_type,subject,dependents,recreate_now=F
             subject,"\n\t".join(missing)))
 
     return pre_script,post_script
-
-
-def process_database_change(db,file):
-    pre_script = []
-    #   Directory-based detection: filename (minus .sql) is the db name
-    db_name = file.filename().replace('.sql','')
-
-    if db.database_exists(db_name):
-        print(f"\tDatabase {db_name} already exists -- skipping.")
-        return pre_script
-
-    contents = file.contents()
-    contents = sqlpreprocessor.preprocess(contents)
-    pre_script.extend(contents)
-    return pre_script
 
 
 #	Return the statement in 'file' that adds constraint 'constraint_name',
@@ -1010,9 +1048,10 @@ def order_paths(list, type, state, verbose_flag, cache=None, force_flag=0):
             ) and dependency_path not in state['dependency_file_processed']:
                 print("\tProcessing dependencies in {0}".format(dependency_path))
 
-                line_number = 1
+                line_number = 0
                 with open(dependency_path, 'r') as m:
                     for line in m:
+                        line_number = line_number + 1
                         line = line.strip('\n')
 
                         line = line.strip()
@@ -1020,6 +1059,14 @@ def order_paths(list, type, state, verbose_flag, cache=None, force_flag=0):
                             (child, parent) = line.split(':', 2)
                             child=child.strip()
                             parent=parent.strip()
+
+                            #   A name that matches no file would silently not apply. Files
+                            #   are known by name across directories of the same type
+                            #   (data/ and data/dev/), so check against all of them.
+                            for name in [ child,parent ]:
+                                if name not in [ basename(p) for p in list if list[p] == type ]:
+                                    errorExit("{0}, line {1}: there is no {2} file {3}".format(
+                                        dependency_path,line_number,type,name))
 
                             if child not in state['dependency'].keys():
                                 state['dependency'][child] = [ parent ]
@@ -1101,7 +1148,7 @@ def ordering_state():
     return { 'manifest': {}, 'dependency': {}, 'manifest_file_processed': [], 'dependency_file_processed': [] }
 
 
-def process_objects(db, cache, list, force_flag, dev_flag, verbose_flag):
+def process_objects(db, cache, list, force_flag, dev_flag, verbose_flag, aliases):
 
     privilege_file = []
     change_script = []
@@ -1175,7 +1222,7 @@ def process_objects(db, cache, list, force_flag, dev_flag, verbose_flag):
                         privilege_file.append(file)
 
                     elif (file.object_type() == 'database'):
-                        pre_script = pre_script + process_database_change(db,file)
+                        pre_script = pre_script + process_database_change(db,file,aliases)
 
                     elif (file.object_type() == 'post_deployment'):
                         post_script = post_script + process_data_change(
@@ -1259,18 +1306,32 @@ def check_objects(db, cache, objects, dev_flag, verbose_flag):
     return (num_objects,num_differences,fix_script)
 
 
-def process_database_change(db,file):
+def process_database_change(db,file,aliases):
     pre_script = []
     db_name = file.object_name()
+    db_name = aliases.get(db_name,db_name)
 
     if db.database_exists(db_name):
         print(f"\tDatabase {db_name} already exists -- skipping.")
         return pre_script
 
-    contents = file.contents()
+    contents = apply_database_aliases(file.contents(),aliases)
     contents = sqlpreprocessor.preprocess(contents)
     pre_script.extend(contents)
     return pre_script
+
+
+#	Connect to 'target_name', the database of directory database/<directory>,
+#	or abort with the reason when that fails.
+def connect(target_name,directory):
+    try:
+        return db(database=target_name)
+    except RuntimeError as error:
+        cause = error.__cause__ if error.__cause__ != None else error
+        if re.search(r'database "' + re.escape(target_name) + r'" does not exist',str(cause)) != None:
+            errorExit("database {0} (database/{1}) does not exist. If it was dropped, remove {2} and run again.".format(
+                target_name,directory,constants._CACHE_FILENAME))
+        errorExit("cannot connect to database {0} (database/{1}): {2}".format(target_name,directory,str(cause).strip()))
 
 
 def store_change_script(database_name, change_script):
@@ -1285,13 +1346,13 @@ def store_change_script(database_name, change_script):
     return file_name
 
 
-def execute_privileges(current_db,privileges):
+def execute_privileges(current_db,privileges,aliases):
 
     print("Executing privileges:")
     for f in privileges:
         print("Processing privileges file {0}:".format(f.filename()))
 
-        change_script = f.contents()
+        change_script = apply_database_aliases(f.contents(),aliases)
         change_script = sqlpreprocessor.preprocess(change_script)
         change_script.append('--   END OF PRIVILEGES\n')
 
@@ -1365,12 +1426,13 @@ def print_script(title,script):
     print("")
 
 
-def process_files(repo_path, cache, files, database_name, environment, force_flag, verbose_flag, dev_flag, dry_run_flag=False):
+def process_files(repo_path, cache, files, database_name, environment, force_flag, verbose_flag, dev_flag, dry_run_flag=False, aliases={}):
 
     objects = collect_objects(repo_path,files,database_name,environment)
 
-    #   Directory name = postgres database name
-    current_db = db(database=database_name)
+    #   Directory name = postgres database name, unless the alias file says otherwise
+    target_name = aliases.get(database_name,database_name)
+    current_db = connect(target_name,database_name)
 
     #	create tmp schema if not exist
     #   Skip tmp schema for bootstrap databases (postgres, template1) — we only
@@ -1380,10 +1442,10 @@ def process_files(repo_path, cache, files, database_name, environment, force_fla
     print("Deploying on {0}@{1} (environment: {2}):".format(current_db.db_name(),current_db.host(),environment if environment != None else 'none'))
 
     change_script = []
-    change_script.append("--	START OF CHANGESCRIPT on " + database_name)
+    change_script.append("--	START OF CHANGESCRIPT on " + target_name)
     change_script.append("BEGIN;")
 
-    ps,cs,pr,po=process_objects(current_db, cache, objects, force_flag, dev_flag, verbose_flag)
+    ps,cs,pr,po=process_objects(current_db, cache, objects, force_flag, dev_flag, verbose_flag, aliases)
 
     if dry_run_flag:
         #   Show everything that would run, in the order it would run, and stop.
@@ -1392,7 +1454,7 @@ def process_files(repo_path, cache, files, database_name, environment, force_fla
         if len(cs) > 0:
             print_script("Dry run -- change script:",change_script + cs + [ "COMMIT;" ])
         for f in pr:
-            print_script("Dry run -- privileges from {0}:".format(f.filename()),sqlpreprocessor.preprocess(f.contents()))
+            print_script("Dry run -- privileges from {0}:".format(f.filename()),sqlpreprocessor.preprocess(apply_database_aliases(f.contents(),aliases)))
         if len(po) > 0:
             print_script("Dry run -- post-deployment:",[ "BEGIN;" ] + po + [ "COMMIT;" ])
         if len(ps) + len(cs) + len(pr) + len(po) == 0:
@@ -1419,13 +1481,13 @@ def process_files(repo_path, cache, files, database_name, environment, force_fla
 
     if (len(change_script) != 0):
 
-        file_name = store_change_script(database_name, change_script)
+        file_name = store_change_script(target_name, change_script)
         print("Changescript available at: " + file_name)
         result = current_db.execute(change_script, verbose_flag)
         if (result != None):
             errorExit(result)
 
-    execute_privileges(current_db,pr)
+    execute_privileges(current_db,pr,aliases)
 
     execute_post_deployment(current_db,po,verbose_flag)
 
@@ -1442,11 +1504,12 @@ def process_files(repo_path, cache, files, database_name, environment, force_fla
 #	differences are resolved in one transaction (or, with dry_run_flag, the
 #	script that would do so is printed). Returns the number of differences
 #	left unresolved.
-def check_files(repo_path, cache, files, database_name, environment, fix_flag, dry_run_flag, verbose_flag, dev_flag):
+def check_files(repo_path, cache, files, database_name, environment, fix_flag, dry_run_flag, verbose_flag, dev_flag, aliases={}):
 
     objects = collect_objects(repo_path,files,database_name,environment)
 
-    current_db = db(database=database_name)
+    target_name = aliases.get(database_name,database_name)
+    current_db = connect(target_name,database_name)
 
     if database_name not in ('postgres','template1'):
         current_db.create_tmp_schema()
@@ -1458,13 +1521,13 @@ def check_files(repo_path, cache, files, database_name, environment, fix_flag, d
 
     if num_differences > 0 and fix_flag and len(fix_script) > 0:
         script = []
-        script.append("--\tSTART OF FIX on " + database_name)
+        script.append("--\tSTART OF FIX on " + target_name)
         script.append("BEGIN;")
         script.extend(fix_script)
         script.append("COMMIT;")
         script.append("--\tEND OF FIX")
 
-        file_name = store_change_script(database_name,script)
+        file_name = store_change_script(target_name,script)
         print("Fix script available at: " + file_name)
 
         if dry_run_flag:
@@ -1502,17 +1565,195 @@ def rebuild_cache(repo_root, cache, all_files):
     return
 
 
+#	Return (db_to_process,db_order): {name: path} of the databases in the
+#	repository, narrowed to 'db_argument' (the --db list) when given, and
+#	their names in processing order -- postgres first.
+def select_databases(repo_path,db_argument):
+    main_db_path = repo_path + '/database'
+
+    if not os.path.isdir(main_db_path):
+        print("No database directory found in {0}. Use --repo to point at the repository root, the directory containing database/.".format(os.path.abspath(repo_path)))
+        sys.exit(-1)
+
+    #   Collect databases in repo
+    all_databases = {}
+    for f_entry in os.listdir(main_db_path):
+        db_path = main_db_path + '/' + f_entry
+        if os.path.isdir(db_path):
+            all_databases[f_entry] = db_path
+
+    #   Narrow to specified db's in arguments
+    db_to_process = {}
+    if db_argument != None:
+        databases = db_argument.split(",")
+        for d in databases:
+            if d in all_databases.keys():
+                db_to_process[d] = all_databases[d]
+            else:
+                print(f"Unknown database {d}. Exiting.")
+                sys.exit(-1)
+    else:
+        db_to_process = all_databases
+
+    #   postgres must be processed first — it's where CREATE ROLE and CREATE DATABASE
+    #   for the actual application databases live.
+    db_order = list(db_to_process.keys())
+    if 'postgres' in db_order:
+        db_order.remove('postgres')
+        db_order.insert(0,'postgres')
+
+    return (db_to_process,db_order)
+
+
+#	Return (value,source) for the connection parameter held in environment
+#	variable 'variable', the way db.py resolves it: the variable when set,
+#	'default' otherwise.
+def connection_parameter(variable,default,default_source):
+    value = os.environ.get(variable)
+    if value is not None:
+        return (value,"${0}".format(variable))
+
+    return (default,default_source)
+
+
+#	Split a password file line into its fields. '\' escapes ':' and '\'.
+def pgpass_fields(line):
+    fields = []
+    current = ''
+    escaped = False
+
+    for character in line:
+        if escaped:
+            current = current + character
+            escaped = False
+        elif character == '\\':
+            escaped = True
+        elif character == ':':
+            fields.append(current)
+            current = ''
+        else:
+            current = current + character
+
+    fields.append(current)
+    return fields
+
+
+#	Describe where libpq gets the password for user@host:port/database:
+#	$PGPASSWORD, or else the first matching line of the password file
+#	($PGPASSFILE, default ~/.pgpass). The password itself is never shown.
+def password_source(host,port,database,user):
+    if os.environ.get('PGPASSWORD'):
+        return "$PGPASSWORD"
+
+    if os.environ.get('PGPASSFILE'):
+        passfile = os.environ.get('PGPASSFILE')
+        passfile_source = '$PGPASSFILE'
+    else:
+        passfile = os.path.expanduser('~/.pgpass')
+        passfile_source = 'default password file'
+
+    if not os.path.isfile(passfile):
+        return "none -- {0} ({1}) does not exist".format(passfile,passfile_source)
+
+    if os.name != 'nt' and os.stat(passfile).st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        return "none -- {0} ({1}) is ignored by libpq: group or world has access, it must be 0600 or stricter".format(passfile,passfile_source)
+
+    if host is None or user is None:
+        return "unknown -- host and user are needed to search {0} ({1})".format(passfile,passfile_source)
+
+    #   A host starting with '/' is a socket directory, which the password file calls localhost
+    match_host = 'localhost' if host.startswith('/') else host
+    wanted = [ match_host,str(port),database,user ]
+
+    try:
+        with open(passfile,'r') as f:
+            line_number = 0
+            for line in f:
+                line_number = line_number + 1
+                line = line.rstrip('\r\n')
+
+                if line.strip() == '' or line.startswith('#'):
+                    continue
+
+                fields = pgpass_fields(line)
+                if len(fields) < 5:
+                    continue
+
+                matched = True
+                for (pattern,value) in zip(fields[:4],wanted):
+                    if pattern != '*' and pattern != value:
+                        matched = False
+
+                if matched:
+                    return "{0} ({1}), line {2}".format(passfile,passfile_source,line_number)
+
+    except OSError as error:
+        return "unknown -- cannot read {0} ({1}): {2}".format(passfile,passfile_source,error)
+
+    return "none -- no line in {0} ({1}) matches {2}".format(passfile,passfile_source,':'.join(wanted))
+
+
+#	Print the database(s), host, port, user and password source a deployment
+#	would use, and where each value came from. Nothing is connected to.
+def show_target(args,repo_path,environment):
+    print("Deployment target:")
+
+    if args.repo is not None:
+        print("\trepository:   {0}  (--repo)".format(repo_path))
+    elif repo_path is not None:
+        print("\trepository:   {0}  (${1})".format(repo_path,constants._ENV_REPO))
+    else:
+        print("\trepository:   not set  (neither --repo nor ${0})".format(constants._ENV_REPO))
+
+    if args.env is not None:
+        print("\tenvironment:  {0}  (--env)".format(environment))
+    elif environment is not None:
+        print("\tenvironment:  {0}  (${1})".format(environment,ENV_ENVIRONMENT))
+    else:
+        print("\tenvironment:  none  (neither --env nor ${0})".format(ENV_ENVIRONMENT))
+
+    (host,host_source) = connection_parameter('PGHOST',None,'$PGHOST not set -- required')
+    (port,port_source) = connection_parameter('PGPORT','5432','$PGPORT not set -- default in db.py')
+    (user,user_source) = connection_parameter('PGUSER',None,'$PGUSER not set -- required')
+
+    print("\thost:         {0}  ({1})".format(host if host is not None else 'not set',host_source))
+    print("\tport:         {0}  ({1})".format(port,port_source))
+    print("\tuser:         {0}  ({1})".format(user if user is not None else 'not set',user_source))
+
+    if os.environ.get('PGDATABASE') is not None:
+        print("\t$PGDATABASE={0} is ignored: the database name comes from the repository".format(os.environ.get('PGDATABASE')))
+
+    #   The database names are the directories under <repo>/database/ -- without
+    #   a repository only those named by --db are known.
+    aliases = {}
+    if repo_path is not None:
+        (aliases,alias_path) = read_aliases(repo_path)
+        (db_to_process,db_order) = select_databases(repo_path,args.db)
+        source = '{0}/database/{1}' + (', selected by --db' if args.db != None else '')
+    elif args.db != None:
+        db_order = args.db.split(",")
+        source = '--db, not checked against a repository'
+    else:
+        db_order = []
+
+    if len(db_order) == 0:
+        if repo_path is None:
+            print("\tdatabase:     unknown  (the database names are the directories under <repo>/database/ -- set --repo or ${0}, or name them with --db)".format(constants._ENV_REPO))
+        else:
+            print("\tdatabase:     none  (no directories under {0}/database/)".format(repo_path))
+        return
+
+    for name in db_order:
+        password = password_source(host,port,aliases.get(name,name),user)
+        if name in aliases:
+            print("\tdatabase:     {0}  (alias of {1}, from {2})  [password: {3}]".format(aliases[name],source.format(repo_path,name),alias_path,password))
+        else:
+            print("\tdatabase:     {0}  ({1})  [password: {2}]".format(name,source.format(repo_path,name),password))
+
+
 def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
-
-    required_env = ['PGHOST','PGUSER']
-    missing = [v for v in required_env if not os.environ.get(v)]
-    if missing:
-        print(f"Missing required environment variable(s): {', '.join(missing)}.")
-        print("Set PGHOST and PGUSER (and optionally PGPORT, PGDATABASE), and configure ~/.pgpass for passwords.")
-        sys.exit(-1)
-
 
     #	Set up parser
     parser = argparse.ArgumentParser(prog='db_deployer',description='Deploy changed or new files to your sandbox database')
@@ -1525,6 +1766,7 @@ def main(argv=None):
     parser.add_argument('--check',action="store_true",help="compare the database with the repo and report the differences")
     parser.add_argument('--fix',action="store_true",help="resolve the differences found by --check (implies --check)")
     parser.add_argument('--dry-run',dest='dry_run',action="store_true",help="with --run or --fix: print what would be executed, execute nothing")
+    parser.add_argument('--show_target',action="store_true",help="show the database(s), host, port, user and password source a deployment would use, and where each came from")
     parser.add_argument('--verbose',action="store_true",help="show output")
 
     args = parser.parse_args()
@@ -1538,6 +1780,21 @@ def main(argv=None):
     check_flag = args.check or args.fix
     dry_run_flag = args.dry_run
 
+    repo_path = args.repo if args.repo is not None else os.environ.get(constants._ENV_REPO)
+    environment = args.env if args.env is not None else os.environ.get(ENV_ENVIRONMENT)
+
+    #   Before the checks below, so that it also reports what is missing
+    if args.show_target:
+        show_target(args,repo_path,environment)
+        sys.exit(0)
+
+    required_env = ['PGHOST','PGUSER']
+    missing = [v for v in required_env if not os.environ.get(v)]
+    if missing:
+        print(f"Missing required environment variable(s): {', '.join(missing)}.")
+        print("Set PGHOST and PGUSER (and optionally PGPORT, PGDATABASE), and configure ~/.pgpass for passwords.")
+        sys.exit(-1)
+
     if run_flag and check_flag:
         print("--run and --check/--fix are mutually exclusive.")
         sys.exit(-1)
@@ -1546,8 +1803,6 @@ def main(argv=None):
         print("--dry-run needs --run or --fix.")
         sys.exit(-1)
 
-    repo_path = args.repo if args.repo is not None else os.environ.get(constants._ENV_REPO)
-    environment = args.env if args.env is not None else os.environ.get(ENV_ENVIRONMENT)
     if repo_path is None:
         print(f"Repo path not set. Use --repo or export {constants._ENV_REPO}.")
         sys.exit(-1)
@@ -1567,38 +1822,11 @@ def main(argv=None):
     num_differences = 0
     my_cache = cache(repo_path)
 
-    main_db_path = repo_path + '/database'
+    (aliases,alias_path) = read_aliases(repo_path)
+    for directory in sorted(aliases):
+        print("Database {0} deploys to {1} (alias from {2})".format(directory,aliases[directory],alias_path))
 
-    if not os.path.isdir(main_db_path):
-        print("No database directory found in {0}. Use --repo to point at the repository root, the directory containing database/.".format(os.path.abspath(repo_path)))
-        sys.exit(-1)
-
-    #   Collect databases in repo
-    all_databases = {}
-    for f_entry in os.listdir(main_db_path):
-        db_path = main_db_path + '/' + f_entry
-        if os.path.isdir(db_path):
-            all_databases[f_entry] = db_path
-
-    #   Narrow to specified db's in arguments
-    db_to_process = {}
-    if args.db != None:
-        databases = args.db.split(",")
-        for d in databases:
-            if d in all_databases.keys():
-                db_to_process[d] = all_databases[d]
-            else:
-                print(f"Unknown database {d}. Exiting.")
-                sys.exit(-1)
-    else:
-        db_to_process = all_databases
-
-    #   postgres must be processed first — it's where CREATE ROLE and CREATE DATABASE
-    #   for the actual application databases live.
-    db_order = list(db_to_process.keys())
-    if 'postgres' in db_order:
-        db_order.remove('postgres')
-        db_order.insert(0,'postgres')
+    (db_to_process,db_order) = select_databases(repo_path,args.db)
 
     for current_db in db_order:
         print("Collecting files for {0} database:".format(current_db))
@@ -1626,11 +1854,11 @@ def main(argv=None):
         all_files.sort()
 
         if run_flag == True:
-            process_files(repo_path,my_cache,all_files,current_db,environment,0,verbose_flag,dev_flag,dry_run_flag)
+            process_files(repo_path,my_cache,all_files,current_db,environment,0,verbose_flag,dev_flag,dry_run_flag,aliases)
             i_did_something = True
 
         if check_flag == True:
-            num_differences = num_differences + check_files(repo_path,my_cache,all_files,current_db,environment,fix_flag,dry_run_flag,verbose_flag,dev_flag)
+            num_differences = num_differences + check_files(repo_path,my_cache,all_files,current_db,environment,fix_flag,dry_run_flag,verbose_flag,dev_flag,aliases)
             i_did_something = True
 
     if i_did_something == False:
